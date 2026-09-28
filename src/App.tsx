@@ -130,7 +130,7 @@ export default function App() {
         </Paper>
         <Paper class="panel export-panel" elevation={0}>
           <div class="panel-heading"><div><span class="eyebrow">EXPORT & BACKUP</span><h3>研究数据出口</h3></div></div>
-          <p>导出包含完整主题路径、双编码者判断、备忘录、主题示例和审计记录。CSV 适合表格复核，JSON 可完整回档。</p>
+          <p>导出包含完整主题路径、每个片段双方编码者的判断与一致性标记、备忘录、主题示例和审计记录。CSV 适合逐行核对一致性，JSON 可完整回档。</p>
           <div class="button-row"><Button variant="contained" onClick={() => store.downloadExport('json')}>下载 JSON 完整包</Button><Button variant="outlined" onClick={() => store.downloadExport('csv')}>下载 CSV 编码表</Button></div>
         </Paper>
       </section>

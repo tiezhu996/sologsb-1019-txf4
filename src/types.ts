@@ -43,6 +43,10 @@ export interface CodingState {
   audit: Array<{ id: string; at: string; action: string; detail: string }>;
 }
 
+export type SegmentFilter =
+  | { kind: 'theme'; themeId: string; coder: CoderId | 'both' }
+  | { kind: 'uncoded'; coder: CoderId };
+
 export interface PersistedEnvelope {
   revision: number;
   updatedAt: string;

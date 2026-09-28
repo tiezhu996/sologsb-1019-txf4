@@ -1,7 +1,7 @@
 import { createEffect, createSignal } from 'solid-js';
 import { createStore, reconcile, unwrap } from 'solid-js/store';
 import { seedState } from '../data/seed';
-import type { CoderId, CodingState, PersistedEnvelope, Segment, Theme } from '../types';
+import type { CoderId, CodingState, PersistedEnvelope, Segment, SegmentFilter, Theme } from '../types';
 import { readEnvelope, writeEnvelope } from '../utils/db';
 
 const STORAGE_KEY = 'sologsb-1019-state-v1';
@@ -25,6 +25,7 @@ const [redoStack, setRedoStack] = createSignal<CodingState[]>([]);
 const [remoteEnvelope, setRemoteEnvelope] = createSignal<PersistedEnvelope | null>(null);
 const [storageReady, setStorageReady] = createSignal(false);
 const [lastSavedAt, setLastSavedAt] = createSignal<Date | null>(null);
+const [segmentFilter, setSegmentFilter] = createSignal<SegmentFilter | null>(null);
 let channel: BroadcastChannel | null = null;
 let hydrating = false;
 let saveTimer: number | undefined;
@@ -187,6 +188,8 @@ export function useCodingStore() {
       });
       if (draft.activeThemeId === themeId) draft.activeThemeId = draft.themes[0]?.id ?? '';
     });
+    const current = segmentFilter();
+    if (current?.kind === 'theme' && current.themeId === themeId) setSegmentFilter(null);
   };
 
   const mergeThemes = (sourceId: string, targetId: string) => {
@@ -203,6 +206,10 @@ export function useCodingStore() {
       draft.themes = draft.themes.filter((theme) => theme.id !== sourceId);
       draft.activeThemeId = targetId;
     });
+    const current = segmentFilter();
+    if (current?.kind === 'theme' && current.themeId === sourceId) {
+      setSegmentFilter({ ...current, themeId: targetId });
+    }
   };
 
   const splitTheme = (sourceId: string, newName: string, segmentIds: string[]) => {
@@ -263,27 +270,39 @@ export function useCodingStore() {
   };
 
   const exportCoding = (format: 'json' | 'csv') => {
-    const segmentMap = new Map(state.segments.map((segment) => [segment.id, segment]));
     const themeMap = new Map(state.themes.map((theme) => [theme.id, theme]));
     if (format === 'json') return JSON.stringify({ exportedAt: new Date().toISOString(), ...cloneState(state) }, null, 2);
     const escape = (value: string) => `"${value.replaceAll('"', '""')}"`;
-    const rows = [['片段编号', '时间', '发言人', '原文', '编码者', '主题路径', '备忘录'].map(escape).join(',')];
-    state.segments.forEach((segment) => {
-      (['A', 'B'] as CoderId[]).forEach((coder) => {
-        const name = coder === 'A' ? state.coderA : state.coderB;
-        const themeIds = segment.assignments[coder];
-        const paths = themeIds.length ? themeIds.map((id) => {
-          const names: string[] = [];
-          let current = themeMap.get(id);
-          while (current) {
-            names.unshift(current.name);
-            current = current.parentId ? themeMap.get(current.parentId) : undefined;
-          }
-          return names.join(' / ');
-        }) : ['未编码'];
-        rows.push([segment.id, segment.time, segment.speaker, segment.text, name, paths.join(' | '), segmentMap.get(segment.id)?.note ?? ''].map(escape).join(','));
+    const themePath = (id: string) => {
+      const names: string[] = [];
+      let current = themeMap.get(id);
+      while (current) {
+        names.unshift(current.name);
+        current = current.parentId ? themeMap.get(current.parentId) : undefined;
+      }
+      return names.join(' / ');
+    };
+    const pathsOf = (segment: Segment, coder: CoderId) => {
+      const ids = segment.assignments[coder];
+      return ids.length ? ids.map(themePath).join(' | ') : '未编码';
+    };
+    const sameSet = (a: string[], b: string[]) => a.length === b.length && a.every((id) => b.includes(id));
+    const rows = [['片段编号', '时间', '发言人', '原文', `${state.coderA}（编码者A）判断`, `${state.coderB}（编码者B）判断`, '是否一致', '片段备忘录'].map(escape).join(',')];
+    state.segments
+      .slice()
+      .sort((a, b) => a.transcriptId.localeCompare(b.transcriptId) || a.order - b.order)
+      .forEach((segment) => {
+        rows.push([
+          segment.id,
+          segment.time,
+          segment.speaker,
+          segment.text,
+          pathsOf(segment, 'A'),
+          pathsOf(segment, 'B'),
+          sameSet(segment.assignments.A, segment.assignments.B) ? '一致' : '分歧',
+          segment.note
+        ].map(escape).join(','));
       });
-    });
     return `\uFEFF${rows.join('\n')}`;
   };
 
@@ -312,6 +331,51 @@ export function useCodingStore() {
     setRemoteEnvelope(null);
   };
 
+  const toggleSegmentFilter = (next: SegmentFilter) => {
+    const current = segmentFilter();
+    setSegmentFilter(current && current.kind === next.kind && JSON.stringify(current) === JSON.stringify(next) ? null : next);
+  };
+
+  createEffect(() => {
+    const filter = segmentFilter();
+    if (filter?.kind === 'theme' && !state.themes.some((theme) => theme.id === filter.themeId)) setSegmentFilter(null);
+  });
+
+  const clearSegmentFilter = () => setSegmentFilter(null);
+
+  const segmentMatchesFilter = (segment: Segment, filter: SegmentFilter | null) => {
+    if (!filter) return true;
+    if (filter.kind === 'uncoded') return segment.assignments[filter.coder].length === 0;
+    const inA = segment.assignments.A.includes(filter.themeId);
+    const inB = segment.assignments.B.includes(filter.themeId);
+    if (filter.coder === 'A') return inA;
+    if (filter.coder === 'B') return inB;
+    return inA && inB;
+  };
+
+  const themeCoverage = (themeId: string) => {
+    let byA = 0;
+    let byB = 0;
+    let shared = 0;
+    state.segments.forEach((segment) => {
+      const inA = segment.assignments.A.includes(themeId);
+      const inB = segment.assignments.B.includes(themeId);
+      if (inA) byA += 1;
+      if (inB) byB += 1;
+      if (inA && inB) shared += 1;
+    });
+    return { byA, byB, shared };
+  };
+
+  const filterLabel = () => {
+    const filter = segmentFilter();
+    if (!filter) return '';
+    if (filter.kind === 'uncoded') return `只看${filter.coder === 'A' ? state.coderA : state.coderB}未处理的段落`;
+    const theme = state.themes.find((item) => item.id === filter.themeId);
+    const who = filter.coder === 'both' ? '双方共同选中' : `${filter.coder === 'A' ? state.coderA : state.coderB}选中`;
+    return `${who}「${theme?.name.trim() ?? '已删除主题'}」的片段`;
+  };
+
   const orderedThemes = () => buildTreeOrder(state.themes);
 
   return {
@@ -338,6 +402,12 @@ export function useCodingStore() {
     exportCoding,
     downloadExport,
     orderedThemes,
+    segmentFilter,
+    toggleSegmentFilter,
+    clearSegmentFilter,
+    segmentMatchesFilter,
+    themeCoverage,
+    filterLabel,
     remoteEnvelope,
     keepLocalVersion,
     applyRemoteVersion,
