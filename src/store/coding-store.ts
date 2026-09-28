@@ -1,7 +1,7 @@
 import { createEffect, createSignal } from 'solid-js';
 import { createStore, reconcile, unwrap } from 'solid-js/store';
 import { seedState } from '../data/seed';
-import type { CoderId, CodingState, PersistedEnvelope, Segment, Theme } from '../types';
+import type { CoderId, CodingState, PersistedEnvelope, Segment, SegmentFilter, Theme, ThemeCoverage } from '../types';
 import { readEnvelope, writeEnvelope } from '../utils/db';
 
 const STORAGE_KEY = 'sologsb-1019-state-v1';
@@ -25,9 +25,15 @@ const [redoStack, setRedoStack] = createSignal<CodingState[]>([]);
 const [remoteEnvelope, setRemoteEnvelope] = createSignal<PersistedEnvelope | null>(null);
 const [storageReady, setStorageReady] = createSignal(false);
 const [lastSavedAt, setLastSavedAt] = createSignal<Date | null>(null);
+const [segmentFilter, setSegmentFilterSignal] = createSignal<SegmentFilter | null>(null);
 let channel: BroadcastChannel | null = null;
 let hydrating = false;
 let saveTimer: number | undefined;
+
+const normalizeSegmentFilter = () => {
+  const filter = segmentFilter();
+  if (filter?.type === 'theme' && !state.themes.some((theme) => theme.id === filter.themeId)) setSegmentFilterSignal(null);
+};
 
 const persist = (snapshot: CodingState) => {
   window.clearTimeout(saveTimer);
@@ -118,6 +124,7 @@ export function useCodingStore() {
     setUndoStack(items.slice(0, -1));
     setRedoStack((redo) => [...redo, cloneState(state)]);
     setState(reconcile(previous, { merge: false }));
+    normalizeSegmentFilter();
     persist(previous);
   };
 
@@ -128,6 +135,7 @@ export function useCodingStore() {
     setRedoStack(items.slice(0, -1));
     setUndoStack((undoItems) => [...undoItems, cloneState(state)]);
     setState(reconcile(next, { merge: false }));
+    normalizeSegmentFilter();
     persist(next);
   };
 
@@ -138,6 +146,47 @@ export function useCodingStore() {
     if (coder === 'A') setState('coderA', name);
     else setState('coderB', name);
   };
+
+  const segmentMatchesFilter = (segment: Segment, filter: SegmentFilter | null): boolean => {
+    if (!filter) return true;
+    if (filter.type === 'pending') return segment.assignments[filter.coder].length === 0;
+    const inA = segment.assignments.A.includes(filter.themeId);
+    const inB = segment.assignments.B.includes(filter.themeId);
+    if (filter.coverage === 'A') return inA;
+    if (filter.coverage === 'B') return inB;
+    return inA && inB;
+  };
+
+  const setSegmentFilter = (filter: SegmentFilter | null, searchGlobal = true) => {
+    setSegmentFilterSignal(filter);
+    if (!filter) return;
+    const inCurrentTranscript = state.segments.find(
+      (segment) => segment.transcriptId === state.activeTranscriptId && segmentMatchesFilter(segment, filter)
+    );
+    const match = inCurrentTranscript ?? (searchGlobal
+      ? state.segments.find((segment) => segmentMatchesFilter(segment, filter))
+      : undefined);
+    if (match) {
+      if (match.transcriptId !== state.activeTranscriptId) selectTranscript(match.transcriptId);
+      selectSegment(match.id);
+    }
+  };
+
+  const toggleThemeCoverageFilter = (themeId: string, coverage: ThemeCoverage) => {
+    const current = segmentFilter();
+    const next: SegmentFilter = { type: 'theme', themeId, coverage };
+    setSegmentFilter(current?.type === 'theme' && current.themeId === themeId && current.coverage === coverage ? null : next);
+  };
+
+  const togglePendingFilter = (coder: CoderId) => {
+    const current = segmentFilter();
+    setSegmentFilter(
+      current?.type === 'pending' && current.coder === coder ? null : { type: 'pending', coder },
+      false
+    );
+  };
+
+  const clearSegmentFilter = () => setSegmentFilter(null);
 
   const toggleAssignment = (segmentId: string, coder: CoderId, themeId: string, enabled: boolean) => {
     transaction('调整编码', `${coder === 'A' ? state.coderA : state.coderB} ${enabled ? '添加' : '移除'}主题`, (draft) => {
@@ -187,6 +236,8 @@ export function useCodingStore() {
       });
       if (draft.activeThemeId === themeId) draft.activeThemeId = draft.themes[0]?.id ?? '';
     });
+    const currentFilter = segmentFilter();
+    if (currentFilter?.type === 'theme' && currentFilter.themeId === themeId) setSegmentFilterSignal(null);
   };
 
   const mergeThemes = (sourceId: string, targetId: string) => {
@@ -203,6 +254,10 @@ export function useCodingStore() {
       draft.themes = draft.themes.filter((theme) => theme.id !== sourceId);
       draft.activeThemeId = targetId;
     });
+    const currentFilter = segmentFilter();
+    if (currentFilter?.type === 'theme' && currentFilter.themeId === sourceId) {
+      setSegmentFilterSignal({ type: 'theme', themeId: targetId, coverage: currentFilter.coverage });
+    }
   };
 
   const splitTheme = (sourceId: string, newName: string, segmentIds: string[]) => {
@@ -221,6 +276,15 @@ export function useCodingStore() {
       });
       draft.activeThemeId = newId;
     });
+    const currentFilter = segmentFilter();
+    if (currentFilter?.type === 'theme'
+      && currentFilter.themeId === sourceId
+      && segmentIds.every((id) => {
+        const segment = state.segments.find((item) => item.id === id);
+        return segment ? segmentMatchesFilter(segment, currentFilter) : false;
+      })) {
+      setSegmentFilterSignal({ type: 'theme', themeId: newId, coverage: currentFilter.coverage });
+    }
     return newId;
   };
 
@@ -263,27 +327,60 @@ export function useCodingStore() {
   };
 
   const exportCoding = (format: 'json' | 'csv') => {
-    const segmentMap = new Map(state.segments.map((segment) => [segment.id, segment]));
     const themeMap = new Map(state.themes.map((theme) => [theme.id, theme]));
     if (format === 'json') return JSON.stringify({ exportedAt: new Date().toISOString(), ...cloneState(state) }, null, 2);
     const escape = (value: string) => `"${value.replaceAll('"', '""')}"`;
-    const rows = [['片段编号', '时间', '发言人', '原文', '编码者', '主题路径', '备忘录'].map(escape).join(',')];
-    state.segments.forEach((segment) => {
-      (['A', 'B'] as CoderId[]).forEach((coder) => {
-        const name = coder === 'A' ? state.coderA : state.coderB;
-        const themeIds = segment.assignments[coder];
-        const paths = themeIds.length ? themeIds.map((id) => {
-          const names: string[] = [];
-          let current = themeMap.get(id);
-          while (current) {
-            names.unshift(current.name);
-            current = current.parentId ? themeMap.get(current.parentId) : undefined;
+    const themePath = (themeId: string) => {
+      const names: string[] = [];
+      let current = themeMap.get(themeId);
+      while (current) {
+        names.unshift(current.name);
+        current = current.parentId ? themeMap.get(current.parentId) : undefined;
+      }
+      return names.join(' / ') || '未知主题';
+    };
+    const sameSelection = (a: string[], b: string[]) => a.length === b.length && a.every((id) => b.includes(id));
+    const rows = [[
+      '访谈标题', '片段编号', '片段ID', '时间', '发言人', '原文',
+      '甲编码者', '甲主题', '乙编码者', '乙主题', '是否一致', '差异说明', '片段备注'
+    ].map(escape).join(',')];
+
+    [...state.segments]
+      .sort((a, b) => a.transcriptId.localeCompare(b.transcriptId) || a.order - b.order)
+      .forEach((segment) => {
+        const transcript = state.transcripts.find((item) => item.id === segment.transcriptId);
+        const pathsA = segment.assignments.A.map(themePath);
+        const pathsB = segment.assignments.B.map(themePath);
+        const consistent = sameSelection(segment.assignments.A, segment.assignments.B);
+        let difference = '一致';
+        if (!consistent) {
+          if (!segment.assignments.A.length) difference = `${state.coderA}尚未编码`;
+          else if (!segment.assignments.B.length) difference = `${state.coderB}尚未编码`;
+          else {
+            const onlyA = pathsA.filter((path) => !pathsB.includes(path));
+            const onlyB = pathsB.filter((path) => !pathsA.includes(path));
+            difference = [
+              onlyA.length ? `仅 ${state.coderA}：${onlyA.join(' | ')}` : '',
+              onlyB.length ? `仅 ${state.coderB}：${onlyB.join(' | ')}` : ''
+            ].filter(Boolean).join('；');
           }
-          return names.join(' / ');
-        }) : ['未编码'];
-        rows.push([segment.id, segment.time, segment.speaker, segment.text, name, paths.join(' | '), segmentMap.get(segment.id)?.note ?? ''].map(escape).join(','));
+        }
+        rows.push([
+          transcript?.title ?? '',
+          String(segment.order + 1),
+          segment.id,
+          segment.time,
+          segment.speaker,
+          segment.text,
+          state.coderA,
+          pathsA.join(' | ') || '未编码',
+          state.coderB,
+          pathsB.join(' | ') || '未编码',
+          consistent ? '一致' : '不一致',
+          difference,
+          segment.note
+        ].map(escape).join(','));
       });
-    });
     return `\uFEFF${rows.join('\n')}`;
   };
 
@@ -309,6 +406,7 @@ export function useCodingStore() {
     setUndoStack((items) => [...items, cloneState(state)]);
     setRedoStack([]);
     setState(reconcile(remote.state, { merge: false }));
+    normalizeSegmentFilter();
     setRemoteEnvelope(null);
   };
 
@@ -325,6 +423,12 @@ export function useCodingStore() {
     selectTranscript,
     selectTheme,
     setCoder,
+    segmentFilter,
+    segmentMatchesFilter,
+    setSegmentFilter,
+    toggleThemeCoverageFilter,
+    togglePendingFilter,
+    clearSegmentFilter,
     toggleAssignment,
     batchAssign,
     addTheme,

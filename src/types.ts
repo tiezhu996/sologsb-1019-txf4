@@ -1,4 +1,9 @@
 export type CoderId = 'A' | 'B';
+export type ThemeCoverage = CoderId | 'both';
+
+export type SegmentFilter =
+  | { type: 'theme'; themeId: string; coverage: ThemeCoverage }
+  | { type: 'pending'; coder: CoderId };
 
 export interface Theme {
   id: string;
